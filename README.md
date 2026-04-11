@@ -1,220 +1,239 @@
-# ToonPT: Multimodal Retrieval System for Webtoon Question Answering
+# 전기차 배터리 시계열 이상 탐지 with XAI
 
-> **웹툰 컷을 장면 단위로 이해하고, 사용자의 자연어 질문에 정확한 화/씬을 찾아 답변하는 Multimodal RAG 시스템**  
-> _BOAZ 24기 분석 컨퍼런스 · TEAM 어벤정스_  
-> _정명훈 · 고혜정 · 정예린 · 정현서_
-<img src="team.png">
+> **전기차 배터리팩의 셀 전압 시계열을 분석하여 이상을 탐지하고, XAI로 "왜 이상인가"까지 설명하는 다중 모델 비교 프로젝트**  
+> _BOAZ 24기 분석 컨퍼런스_  
+> _조유진 · 정명훈 · 김완철 · 이윤경_
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue) ![Qdrant](https://img.shields.io/badge/Qdrant-VectorDB-red) ![EXAONE](https://img.shields.io/badge/LLM-EXAONE-orange) ![ko--sbert](https://img.shields.io/badge/embedding-ko--sbert-green)
+![Python](https://img.shields.io/badge/Python-3.10+-blue) ![TensorFlow](https://img.shields.io/badge/TensorFlow-2.x-orange) ![Keras Tuner](https://img.shields.io/badge/Keras--Tuner-Bayesian-red) ![SHAP](https://img.shields.io/badge/XAI-SHAP%20%7C%20Attention%20%7C%20GradCAM-green)
 
-> _"그때 그 장면 몇 화였지?"_ — 연재가 길어진 웹툰에서 독자가 특정 장면을 다시 찾기 위해 스크롤을 거슬러 올라가는 경험을, **자연어 질문 한 줄로 해결**하는 것이 ToonPT의 목표입니다.
-
-📄 참조 논문: [RAPTOR: Recursive Abstractive Processing for Tree-Organized Retrieval (Sarthi et al., 2024)](https://arxiv.org/abs/2401.18059)
+> _"이 셀, 지금 위험한가?"_ — 배터리 셀 전압의 미세한 패턴 변화는 화재·폭발의 전조가 될 수 있습니다. 단순히 분류하는 것을 넘어, **모델이 어느 셀·어느 시점을 보고 그렇게 판단했는지** 까지 해석하는 것이 본 프로젝트의 목표입니다.
 
 ---
 
-## 1. 문제 정의: 왜 웹툰 RAG가 어려운가
+## 1. 문제 정의: 왜 배터리 이상 탐지가 어려운가
 
-웹툰은 일반적인 문서 RAG와 근본적으로 다른 두 가지 특성이 있습니다.
+전기차 배터리는 수십~수백 개의 셀이 직렬·병렬로 묶여 모듈을 이루고, 다시 모듈이 모여 팩을 구성합니다. 하나의 셀이라도 비정상 동작하면 전체 시스템 안전성에 영향을 줍니다.
 
-| 일반 문서 | 웹툰 |
+<p align="center">
+  <img src="assets/battery_structure.png" width="85%"/>
+  <br/>
+  <em>셀 → 모듈 → 팩 → 전기차로 이어지는 배터리 계층 구조</em>
+</p>
+
+| 일반 분류 문제 | 배터리 이상 탐지 |
 |---|---|
-| 텍스트가 1차 정보 | **이미지가 1차 정보**, 텍스트(대사)는 보조 |
-| 단락 단위로 자연 분할 | **세로 스크롤 형태**, 컷 경계가 명시되지 않음 |
-| 의미가 한 단락 안에서 완결 | **연속된 컷의 흐름**으로 의미 형성 |
+| 클래스 간 경계가 시각적으로 명확 | **셀 전압의 미세한 시간적 변화**가 이상의 단서 |
+| 한 시점만 봐도 분류 가능 | **연속된 시점의 흐름**이 있어야 의미 형성 |
+| 오분류 비용이 균등 | **결함 미탐지(False Negative)의 비용이 압도적** |
 
-→ 단순 텍스트 임베딩으로는 부족하고, **이미지 + 대사 + 서사 흐름**을 모두 다루는 멀티모달 파이프라인이 필요합니다.
+특히 셀 전압이 정상 범위(3V ~ 4.2V)를 벗어나면 과방전·과충전 위험이 발생하고, 4.37V 이상에서는 화재로 직결될 수 있습니다.
+
+<p align="center">
+  <img src="assets/anomaly_criteria.png" width="85%"/>
+  <br/>
+  <em>차종(IONIQ 96셀 / NIRO·KONA 98셀)별 셀 구성과 비정상 전압 기준</em>
+</p>
+
+→ 단순 임계값 룰로는 점진적 열화를 잡지 못하므로, **시계열 패턴 학습 + 해석 가능성**을 모두 갖춘 파이프라인이 필요합니다.
 
 ## 2. Architecture 개요
 
-전체 시스템은 **인덱싱 파이프라인**(상)과 **질의 응답 파이프라인**(하) 두 단계로 구성됩니다. 핵심 설계는 두 가지:
+전체 시스템은 **데이터 구축 파이프라인**(상)과 **모델링·해석 파이프라인**(하)으로 구성됩니다. 핵심 설계는 두 가지:
 
-- **DB를 두 종류로 분리**: 씬 단위는 **Vector DB(Qdrant)** 에 임베딩 저장, 화 요약·사건·전체 줄거리·characters 사전은 **Look-up DB**에 그대로 저장
-- **Router가 질문 유형에 따라 경로 분기**: 단순 화 요약 질문은 Look-up만, 장면 찾기 질문은 Vector 검색 + Rerank 경유
+- **모델을 4종으로 분리**: Random Forest · XGBoost · LSTM · CNN을 동일 데이터로 학습시켜 성능과 해석력을 비교
+- **각 모델에 맞는 XAI 기법 매칭**: 트리 계열은 SHAP, 시계열은 Attention, 이미지화는 Grad-CAM
 
-<p align="center">
-  <img src="assets/architecture.png" width="90%"/>
-  <br/>
-  <em>상: 컷 분할 → Caption + OCR → 계층적 서사 구조 → ko-sbert 임베딩 → Qdrant·Look-up DB / 하: User → Router → (Look-up | Query Expansion → Hybrid Search → Rerank) → EXAONE → Answer</em>
-</p>
+```
+NPY 셀 전압 → 폴더명 라벨링 → 96→98 셀 차원 통일 → 100×98 슬라이딩 윈도우
+                                                          ↓
+                                              ┌───────────┴───────────┐
+                                              ↓                       ↓
+                                       4-Model 병렬 학습          XAI 해석
+                                  (RF / XGB / LSTM / CNN)   (SHAP / Attention / Grad-CAM)
+```
 
-## 3. 데이터 전처리: Dynamic Cut Segmentation
+| 담당 | 모델 | XAI 기법 |
+| :--- | :--- | :--- |
+| 김완철 | Random Forest | SHAP (Summary / Waterfall) |
+| 조유진 | XGBoost | SHAP + Feature Importance |
+| **정명훈** | **Bidirectional LSTM + Attention** | **Attention Weights 분석** |
+| 이윤경 | CNN | SHAP / Grad-CAM |
 
-웹툰 raw data는 한 화당 수천 픽셀의 세로 스크롤 이미지입니다. 이를 **컷 단위로 자동 분할**하는 것이 모든 후속 처리의 출발점입니다.
+> 본 README는 그중 **LSTM + Attention** 파트를 중심으로 작성되었습니다.
 
-- **여백 비율 기반 경계 탐지**: 컷 사이의 흰색 여백 영역을 감지해 자동 분할
-- **세로로 긴 컷 추가 분할**: 한 컷이 비정상적으로 길면 비율 기반으로 다시 쪼갬 (단일 컷에 여러 장면이 들어간 경우 대응)
+## 3. 데이터셋: AI-Hub 자율주행 고장진단
 
-<p align="center">
-  <img src="assets/cut_segmentation.png" width="70%"/>
-  <br/>
-  <em>스크롤 raw → 컷 단위 분할. 긴 컷은 추가로 비율 분할되어 장면 단위 검색이 가능해짐</em>
-</p>
-
-## 4. 멀티모달 정보 추출: Caption × OCR 이중 트랙
-
-웹툰의 한 컷에는 **시각적 맥락**(인물 표정·구도)과 **언어적 정보**(대사·효과음)가 공존합니다. 이를 한 모델로 한꺼번에 처리하면 한쪽이 다른 쪽에 묻히는 문제가 생겨, **두 트랙으로 분리 추출**했습니다.
-
-### 4-1. Image Captioning (맥락 트랙)
-- **JoyCaption**으로 컷의 시각 정보 추출
-- **연속된 4컷을 하나의 context window**로 묶어 캡션 생성 → 단일 컷의 의미 모호성을 인접 컷의 맥락으로 보완
-
-### 4-2. Text OCR (근거 트랙)
-- **Comic-Text-Detector**로 말풍선 영역 탐지
-- 탐지된 영역에 **Clova OCR** 적용하여 대사·효과음 추출
+- **출처**: AI-Hub 자율주행 고장진단 데이터셋 (배터리 데이터)
+- **차종**: IONIQ(96셀), NIRO·KONA(98셀)
+- **라벨**: Normal / Caution / Defect (폴더명 기준 자동 라벨링)
 
 <p align="center">
-  <img src="assets/caption_ocr_example.png" width="75%"/>
+  <img src="assets/dataset_structure.png" width="90%"/>
   <br/>
-  <em>좌: Caption summary (시각 맥락) / 우: Text OCR (대사 근거) — 두 정보를 분리 추출 후 통합</em>
+  <em>차종·상태별 폴더 구조와 npy 파일 명명 규칙</em>
 </p>
 
-→ Caption은 *"이 장면에서 무슨 일이 일어나는가"*, OCR은 *"누가 무슨 말을 했는가"* 를 담당. 검색 시 두 정보가 상호 보완.
+⚖️ 본 데이터는 AI-Hub 이용 약관에 따라 연구 목적으로만 활용되었습니다.
 
-## 5. 상향식 서사 계층 구축 (RAPTOR-inspired)
-웹툰은 **장기 의존성**이 강한 매체입니다. 특정 장면의 의미는 그 장면 단독이 아니라 앞 화의 사건, 작품 전체의 서사 안에서 결정됩니다. 이를 단일 임베딩 층으로 다루면 검색이 표면적 매칭에 머무는 문제가 있어, **추상화 수준이 다른 여러 층으로 정보를 쌓는** RAPTOR의 hierarchical summarization 아이디어를 차용했습니다.
-<br>
+## 4. 데이터 전처리: Dynamic Window Construction
 
-Scene (4컷 윈도우, 임베딩 검색 대상)
-↓ EXAONE 요약
-Chapter (한 화 요약, Look-up)
-↓ EXAONE 사건 추출
-Event (사건 단위, Look-up)
-↓ EXAONE 통합 요약
-Full Synopsis (작품 전체 줄거리, Look-up)
+### 4-1. 96 → 98 셀 차원 통일
+IONIQ는 96셀, NIRO/KONA는 98셀로 배터리 팩 구성이 달라 동일 모델에 입력 불가. IONIQ 데이터에 대해 행(row) 평균값 2개를 추가하여 98셀로 확장.
 
-Characters (인물 사전, Query Expansion·답변 보강용)
-| 계층 | 단위 | 저장 위치 | 검색 시 활용 |
-|---|---|---|---|
-| **Scene** | 4컷 윈도우 | **Vector DB (Qdrant)** | 구체적 장면 질의 — 임베딩 검색 |
-| **Chapter** | 한 화 | Look-up DB | 화 요약 질의 — 직접 조회 |
-| **Event** | 사건 단위 | Look-up DB | 답변 생성 시 컨텍스트 보강 |
-| **Full Synopsis** | 작품 전체 | Look-up DB | 답변 생성 시 컨텍스트 보강 |
-| **Characters** | 인물 사전 | Look-up DB | Query Expansion + 답변 생성 |
+> ⚠️ **한계**: defect 샘플의 경우 정상에 가까운 평균값이 추가되어 약한 라벨 노이즈가 발생할 수 있음.
 
-→ **모든 계층을 Vector DB에 넣지 않는 이유**: 화 요약·전체 줄거리는 "검색"의 대상이 아니라 "참조"의 대상이기 때문. Router가 질문 의도를 파악해 필요한 계층만 직접 가져오는 편이 정확하고 빠릅니다.
-
-## 6. 검색 파이프라인: Router로 두 갈래 분기
-
-### 1️⃣ User Input
-사용자의 자연어 질문 (예: *"맥스와 조이가 우산을 같이 쓴 장면은 몇 화인가요?"*)
-
-### 2️⃣ LLM Router (EXAONE)
-질문 의도를 분류해 **두 경로 중 하나**로 분기:
-- **단순 Look-up 경로** — "3화 무슨 내용?" 같은 화 단위 질문 → 화 키워드 추출 → Look-up DB에서 화 요약·사건·전체 줄거리·characters 직접 조회 → 바로 답변 생성
-- **검색 경로** — "우산을 같이 쓴 장면" 같은 장면 찾기 질문 → 아래 3~5단계 진행
-
-### 3️⃣ Query Expander
-원본 쿼리에 `characters.json`(인물 사전)을 결합해 쿼리 재작성. 별명·애칭·관계어 → 정식 인물명으로 매핑하여 **객체 불일치 문제**(예: "맥스" = "강동구") 해결.
-
-### 4️⃣ Hybrid Search
-- **Dense Retrieval**: ko-sbert (`jhgan/ko-sbert-nli`) 임베딩 → 코사인 유사도
-- **Sparse Retrieval**: 쿼리에서 키워드 추출 → BM25
-- **RRF (Reciprocal Rank Fusion)**: 두 결과의 score 단위가 다르므로 **순위 기반**으로 점수 합산 → Top-50 추출
-
-> 💡 BM25를 함께 쓰는 이유: 인물명·고유명사처럼 lexical overlap이 결정적인 쿼리에서 dense retriever가 약한 문제를 보완.
-
-### 5️⃣ Cross-encoder Reranker
-BERT 기반 cross-encoder가 **50개 문서와 쿼리를 각각 페어로 비교**해 새로운 점수를 산출 → 최종 **Top-5** 선별. (Bi-encoder인 ko-sbert와 달리 cross-encoder는 쿼리·문서를 함께 인코딩해 더 정밀한 관련도 측정이 가능)
-
-### 6️⃣ Final Generation
-Top-5 씬 + characters 사전 + 전체 요약을 EXAONE에 프롬프트로 전달 → 최종 답변 생성. **Streamlit**으로 구현한 UI에서 답변과 참조 씬을 함께 보여줌.
-### 5️⃣ Re-ranking & Filtering
-- Scene + Chapter + Event + Full Synopsis 4개 계층에서 **Candidate 50개** 추출
-- Reranker로 **Top-5** 최종 선별
-
-### 6️⃣ Final Generation
-EXAONE이 Top-5 컨텍스트를 받아 최종 답변 생성.
-
-## 7. 평가
-
-### 평가 데이터
-- 대상: 네이버 웹툰 『이직로그』
-- ⚖️ **저작권법 제35조의5(저작물의 공정한 이용)에 의거하여 연구 목적으로만 활용**
-- 독자 perspective 질문 리스트 작성, 정답 라벨링 (정답 위치 + 난이도 1–5)
-
-### 평가 지표
-| 단계 | 지표 | 설명 |
-|---|---|---|
-| **Retrieval** | Recall@3 (Chapter), Recall@5 (Scene) | 정답 화/씬이 검색 결과에 포함되는가 |
-| **Generation** | Exact Match (EM) | 모델 답변이 정답 개체명과 정확히 일치하는가 |
-
-EM은 **검색 성공 ≠ 생성 성공**을 분리해서 보기 위함. 예: 정답 "맥스"인데 모델이 "엔디 님"이라 답하면 → 검색은 성공해도 생성 단계에서 hallucination 발생.
-
-## 8. 결과
+### 4-2. 슬라이딩 윈도우
+상태별 npy 파일을 시간순으로 stack한 뒤, **100시점 × 98셀**의 윈도우로 슬라이딩하며 하나의 학습 패턴으로 인식. 최종적으로 **64,642개의 (100×98) 패턴**이 X_train으로 구축됨.
 
 <p align="center">
-  <img src="assets/chapter_accuracy.png" width="40%"/>
-  <img src="assets/difficulty_accuracy.png" width="55%"/>
+  <img src="assets/sliding_window.png" width="75%"/>
   <br/>
-  <em>좌: 전체 chapter 식별 정확도 약 68% / 우: 난이도별 정확도 — 1~3단계 80%+, 5단계 ~40%</em>
+  <em>시계열 셀 데이터 위를 100시점 윈도우로 슬라이딩하여 학습 패턴 생성</em>
 </p>
 
-### 핵심 수치
-- **에피소드/씬 식별 정확도 약 68%** — 10번의 질문 중 약 7번은 정확한 문맥을 참조하여 답변
-- **난이도 1–3** (단순 키워드/명확한 질문): **평균 80% 이상**
-- **난이도 4–5** (모호한 질문/추상적 표현): **40–55%로 급격히 하락**
+→ 단일 시점이 아닌 **100시점의 흐름**을 하나의 입력으로 다루기 때문에, 점진적 열화나 미세한 패턴 변화도 학습 가능.
 
-### 핵심 진단: Semantic Gap
-난이도 4–5 구간의 성능 하락은 **텍스트 임베딩만으로는 해결하기 어려운 의미 격차(Semantic Gap)** 를 보여줍니다. 사용자가 *"두 사람이 어색하게 침묵하는 장면"* 처럼 묘사할 때, 캡션과 OCR에는 그 단어가 직접 등장하지 않아 검색이 실패하는 케이스.
+## 5. LSTM + Attention Implementation Details
 
-### 정성 분석
+단순한 시계열 분류를 넘어, **"왜 이상인가"** 를 설명할 수 있도록 Attention 기반으로 설계된 세부 로직입니다.
 
-| 케이스 | 질문 | 결과 |
-|---|---|---|
-| ✅ 성공 | "맥스와 조이가 우산을 같이 쓴 장면" | 14화 50–69컷 정확히 검색·답변 |
-| ✅ 성공 | "에스더가 전 남자친구의 바람을 알아챈 장면" | 10화 32컷 정확 |
-| ❌ 실패 | "조이가 맥스에게 벚꽃을 뿌려주는 장면" (정답 7화 후반) | 5화 63컷으로 오답 — 시각적 묘사 매칭 실패 |
-| ❌ 실패 | "조이가 맥스를 이직스터디 파트너로 정한 이유" (정답 4화 후반) | 3화 77컷으로 오답 — 추론형 질문 |
+### 5-1. 모델 구조
 
-## 9. Conclusion
+<p align="center">
+  <img src="assets/lstm_architecture.png" width="85%"/>
+  <br/>
+  <em>Bidirectional LSTM × N → Attention Layer → Dense Softmax</em>
+</p>
 
-1. **멀티모달 데이터 구조화** — 시각 요소(JoyCaption) + 대사(OCR) + 상세 설명을 통합해 LLM이 시각 매체인 웹툰을 텍스트 기반으로 이해할 수 있는 고품질 데이터셋 구축
-2. **상향식 서사 계층** — Scene → Chapter → Synopsis → Event의 4단 계층으로 다양한 추상화 수준의 질의에 대응
-3. **RAG 파이프라인 최적화** — Hybrid Search(Vector + BM25) + Re-ranking 도입으로 사용자의 모호한 질문에도 정확한 씬 검색
+```
+Input (sequence_length=100, features=98)
+   ↓
+[ Bidirectional LSTM → Dropout ] × N    (N=2~4, Tuner 탐색)
+   ↓
+AttentionLayer  (가중치 계산 + weighted sum)
+   ↓
+Dense(3, softmax) → {Normal, Caution, Defect}
+```
 
-## 10. Future Direction
+### 5-2. 왜 Bidirectional LSTM + Attention인가
+- **Bi-LSTM**: 배터리 셀의 이상 신호는 과거뿐 아니라 회복 구간(미래 시점)을 함께 봐야 의미가 명확해짐 → 양방향 인코딩 필수
+- **Attention Layer**: 100 time step 중 어느 시점이 분류에 결정적이었는지 가중치로 표현 → **해석 가능성** 확보 (SHAP 대체 수단으로도 활용)
 
-### 데이터 범용성 및 확장성
-- 특정 웹툰의 설정(등장인물, 세계관)에 종속되지 않는 **컷 단위 공통 JSON 스키마** 설계
-- 장르·연출 방식이 다른 웹툰에도 추가 규칙 정의 없이 데이터셋 확장 가능
+### 5-3. 메모리 & 학습 최적화
+- **Mixed Precision (`mixed_float16`)**: float16 연산으로 GPU 메모리 절반 절약, 연산 속도 향상
+- **MinMaxScaler**: 3D 시계열을 2D로 reshape하여 정규화 후 원형 복원
+- **Keras Tuner (Bayesian Optimization)**: LSTM 레이어 수(2~4), 유닛 수(64~256), Dropout(0.1~0.5), learning rate를 자동 탐색 (max_trials=10)
+- **Exponential LR Decay**: `lr * 0.9^epoch` — 초반 빠른 수렴 + 후반 미세 조정
+- **Early Stopping** (patience=10) 으로 과적합 방지
+- L2 정규화 모델 vs Tuned-only 모델을 비교 후 더 나은 쪽을 최종 채택
 
-### 신규 회차 자동 인덱싱 파이프라인 (B2B 상용화의 핵심)
-ToonPT는 **B2B 모델**을 전제로 설계되었습니다. 즉 독자가 새 화 업데이트를 확인하는 용도가 아니라, **플랫폼이 신규 화를 올릴 때마다 백엔드에서 자동으로 인덱스를 갱신**하는 용도. 이를 위해:
-- 신규 화 업데이트 시 전체 재처리 없이 **신규 컷만 자동 감지** → Caption · OCR · 메타데이터 생성
-- 기존 Vector DB와 Look-up DB에 증분 추가 → 최신 내용이 검색에 즉시 반영
+## 6. 결과
 
-이 자동화 파이프라인이 완성되어야 진짜 상용 가능한 서비스가 됩니다.
+<p align="center">
+  <img src="assets/lstm_results.png" width="90%"/>
+  <br/>
+  <em>좌: Train/Val Loss 곡선 / 우: Final Classification Report (Test Acc 0.9658)</em>
+</p>
+
+| Class | Precision | Recall | F1-score | Support |
+| :--- | :---: | :---: | :---: | :---: |
+| Normal (0)  | 0.98 | 1.00 | 0.99 | 3,317 |
+| Caution (1) | 0.96 | 0.96 | 0.96 | 2,408 |
+| Defect (2)  | 0.95 | 0.93 | 0.94 | 2,376 |
+| **Accuracy** | | | **0.9658** | 8,101 |
+
+다만 Validation Loss가 epoch 후반에 상승하는 양상이 있어, 일반화 측면에서 추가 개선 여지가 존재합니다.
+
+### 모델별 비교
+
+| 모델 | Test Accuracy | XAI |
+| :--- | :---: | :--- |
+| Random Forest (n=500, depth=100) | 0.9875 | SHAP Summary / Waterfall |
+| XGBoost (multi:softmax) | **0.9981** | SHAP + Feature Importance |
+| **LSTM + Attention (Ours)** | **0.9658** | **Attention Weights** |
+| CNN | 과적합 발생 | Grad-CAM |
+
+## 7. XAI: Attention 분석 (SHAP 대체)
+
+처음에는 SHAP의 KernelExplainer를 적용하려 했으나, **3D 시계열 입력에 대해 A100 GPU에서도 RAM OOM**이 발생해 포기했습니다. 대신 모델 내부의 Attention Layer가 출력하는 가중치를 직접 분석하는 방향으로 전환했습니다.
+
+### 7-1. 핵심 발견: Time Step 61
+
+모든 샘플에서 attention weight가 최대가 되는 시점은 **time step 61** (값 약 0.9992). 즉, 모델은 100시점 윈도우 중 특정 구간에 일관되게 집중하여 이상 여부를 판단합니다.
+
+<p align="center">
+  <img src="assets/attention_weights.png" width="75%"/>
+  <br/>
+  <em>Sample 0의 Attention Weights — 빨간 점은 weight ≥ 0.1인 중요 시점</em>
+</p>
+
+### 7-2. 원본 시계열과의 대응
+
+같은 샘플의 정규화된 셀 전압 시계열을 보면, time step 40~60 구간에서 다수의 셀 값이 동시에 하강하는 패턴이 관찰됩니다. 모델은 바로 이 구간을 가장 중요한 의사결정 근거로 삼고 있음.
+
+<p align="center">
+  <img src="assets/raw_timeseries.png" width="75%"/>
+  <br/>
+  <em>Sample 0의 100 time step × 98 셀 정규화 전압 변화 — Attention이 강조한 구간과 시각적으로 일치</em>
+</p>
+
+→ 향후 이 그래프 위에 attention weight를 히트맵으로 오버레이하면 해석력이 더 강화될 것.
+
+## 8. Conclusion
+
+1. **시계열 패턴 학습** — Bi-LSTM + Attention으로 단일 시점 룰 기반 탐지의 한계를 넘어 96.58%의 분류 정확도 달성
+2. **해석 가능한 이상 탐지** — Attention 가중치 분석으로 "어느 시점이 결정적이었는가"를 시각화, SHAP의 메모리 한계를 우회
+3. **다중 모델 비교 프레임워크** — 동일 데이터셋 위에서 4가지 모델·XAI 조합을 비교해 모델별 강점과 한계를 정량적으로 파악
+
+## 9. Future Direction
 
 ### 모델 측면
-- 웹툰 특화 연출 인식을 위한 **VLM 파인튜닝** (특히 난이도 4–5 구간 개선용)
-- Multimodal embedding 직접 도입 (CLIP 계열) — 현재 텍스트화 후 임베딩하는 우회 방식의 한계 보완
+- **Feature Attention + Temporal Attention 2단 구조** — "어느 셀이 / 어느 시점에" 중요한지를 동시에 해석 가능
+- **차종별 분리 학습** — 96→98 확장의 라벨 노이즈를 제거하기 위해 IONIQ / NIRO·KONA를 별도 모델로
+
+### 해석 측면
+- **메타데이터 컬럼 보존** — 각 샘플이 어느 날짜·파일·셀에 해당하는지 추적 가능한 컬럼을 학습에서는 제외하되 분석용으로 보관 → SHAP feature name에 활용
+- **Attention × Raw Signal 오버레이** — 셀 전압 그래프 위에 attention weight를 색상으로 직접 표시
+
+### 운영 측면
+- **실시간 스트리밍 추론** — 슬라이딩 윈도우를 온라인으로 적용해 BMS에 직접 결합
 
 ---
 
 ## 🛠️ 기술 스택
 
-**Vision & OCR**: `JoyCaption` · `Comic-Text-Detector` · `Clova OCR`  
-**LLM**: `EXAONE` (Router · Summarization · Generation)  
-**Embedding**: `ko-sbert (jhgan/ko-sbert-nli)`  
-**Retrieval**: `Qdrant` (Vector DB) · `BM25` · `RRF` · `Reranker`  
-**Language**: `Python`
-**UI**: `Streamlit`
-
-## 📚 참고 문헌
-
-- Sarthi, P. et al. (2024). [RAPTOR: Recursive Abstractive Processing for Tree-Organized Retrieval](https://arxiv.org/abs/2401.18059). *ICLR 2024*.
-- 본 프로젝트는 RAPTOR의 hierarchical summarization 아이디어를 웹툰의 서사 구조(Scene → Chapter → Synopsis → Event)에 맞게 재구성하여 적용했습니다.
+**Modeling**: `TensorFlow / Keras` · `Bidirectional LSTM` · `Attention Layer`  
+**Tuning**: `Keras Tuner (Bayesian Optimization)` · `Mixed Precision (float16)`  
+**XAI**: `Attention Weights` · `SHAP` · `Grad-CAM`  
+**Comparison Models**: `Random Forest` · `XGBoost` · `CNN`  
+**Language**: `Python 3.10+`  
+**Environment**: `Google Colab Pro (A100)`
 
 ## 📁 저장소 구조
 
 ```text
 ├── assets/                    # README 이미지
-├── preprocessing/             # Dynamic Cut Segmentation
-├── extraction/                # JoyCaption + Comic-Text-Detector + Clova OCR
-├── indexing/                  # Scene → Chapter → Synopsis → Event 계층 생성
-├── retrieval/                 # Router + Query Expander + Hybrid Search + Reranker
-├── generation/                # EXAONE 답변 생성
-├── evaluation/                # Recall@k + EM 평가
-└── ToonPT_발표자료.pdf
+├── data/                      # AI-Hub 배터리 데이터 (gitignore)
+│   ├── Dev_96/                # IONIQ
+│   ├── Dev_98/                # KONA, NIRO
+│   ├── X_train.npy            # (64642, 100, 98)
+│   └── Y_train.npy
+├── code/
+│   ├── lstm_xai.ipynb         # 배터리_lstm복잡화.ipynb (LSTM + Attention)
+│   ├── random_forest_xai.ipynb
+│   ├── xgboost_xai.ipynb
+│   └── cnn_xai.ipynb
+├── models/                    # 학습된 가중치
+│   ├── best_model_tuned.h5
+│   └── lstm_tuner_attention_weights.npy
+└── 발표자료.pdf
 ```
+
+## 참여자
+
+- **조유진**: XGBoost + XAI
+- **정명훈**: LSTM + XAI — https://github.com/Cjapysql
+- **김완철**: Random Forest + XAI
+- **이윤경**: CNN + XAI
+
+---
