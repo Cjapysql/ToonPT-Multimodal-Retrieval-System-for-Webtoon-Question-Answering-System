@@ -3,6 +3,7 @@
 > **웹툰 컷을 장면 단위로 이해하고, 사용자의 자연어 질문에 정확한 화/씬을 찾아 답변하는 Multimodal RAG 시스템**  
 > _BOAZ 24기 분석 컨퍼런스 · TEAM 어벤정스_  
 > _정명훈 · 고혜정 · 정예린 · 정현서_
+<img src="assets/team.png">
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue) ![Qdrant](https://img.shields.io/badge/Qdrant-VectorDB-red) ![EXAONE](https://img.shields.io/badge/LLM-EXAONE-orange) ![ko--sbert](https://img.shields.io/badge/embedding-ko--sbert-green)
 
