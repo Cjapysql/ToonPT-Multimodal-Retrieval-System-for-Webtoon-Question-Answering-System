@@ -10,6 +10,11 @@
 > _"그때 그 장면 몇 화였지?"_ — 연재가 길어진 웹툰에서 독자가 특정 장면을 다시 찾기 위해 스크롤을 거슬러 올라가는 경험을, **자연어 질문 한 줄로 해결**하는 것이 ToonPT의 목표입니다.
 
 📄 참조 논문: [RAPTOR: Recursive Abstractive Processing for Tree-Organized Retrieval (Sarthi et al., 2024)](https://arxiv.org/abs/2401.18059)
+## 🎬 ToonPT 시연 영상
+
+[![ToonPT 시연 영상](https://img.youtube.com/vi/0aHOB7mJ3Co/0.jpg)](https://youtu.be/0aHOB7mJ3Co)
+
+*위 이미지를 클릭하면 유튜브 시연 영상으로 이동합니다.*
 
 ---
 
